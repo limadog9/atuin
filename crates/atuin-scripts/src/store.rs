@@ -106,24 +106,9 @@ impl ScriptStore {
     }
 
     pub async fn build(&self, database: Database) -> Result<()> {
-        // Clear existing data before replaying all records from the store.
-        // Without this, stale rows can cause unique constraint violations
-        // when records are replayed (eg name conflicts from renamed scripts).
-        database.clear().await?;
-
         // Get all the scripts from the store - they are already sorted by timestamp
         let scripts = self.scripts().await?;
-
-        for script in scripts {
-            match script {
-                ScriptRecord::Create(script) => {
-                    database.save(&script).await?;
-                }
-                ScriptRecord::Update(script) => database.update(&script).await?,
-                ScriptRecord::Delete(id) => database.delete(&id.to_string()).await?,
-            }
-        }
-
+        database.rebuild(&scripts).await?;
         Ok(())
     }
 }

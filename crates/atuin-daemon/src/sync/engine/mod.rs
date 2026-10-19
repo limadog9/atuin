@@ -1,5 +1,6 @@
 //! The sync engine handle.
 
+mod scripts;
 mod worker;
 
 use std::sync::Arc;

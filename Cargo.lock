@@ -556,6 +556,7 @@ dependencies = [
  "atuin-domain",
  "atuin-history",
  "atuin-octavo",
+ "atuin-scripts",
  "dashmap",
  "derive_more",
  "divan",

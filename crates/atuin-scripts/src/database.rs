@@ -8,6 +8,7 @@ use sqlx::sqlite::{SqlitePool, SqliteRow};
 use sqlx::{Result, Row};
 use tracing::{debug, instrument};
 
+use crate::store::record::ScriptRecord;
 use crate::store::script::Script;
 
 const SCRIPT_COLUMNS: &str = "id, name, description, shebang, script";
@@ -167,12 +168,19 @@ impl Database {
     pub async fn delete(&self, id: &str) -> Result<()> {
         debug!("deleting script {}", id);
 
-        db::query("delete from scripts where id = ?1").bind(id).execute(self.sqlite.pool()).await?;
+        let mut tx = self.sqlite.pool().begin().await?;
+        Self::delete_raw(&mut tx, id).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn delete_raw(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>, id: &str) -> Result<()> {
+        db::query("delete from scripts where id = ?1").bind(id).execute(&mut **tx).await?;
 
         // delete all the tags for the script
         db::query("delete from script_tags where script_id = ?1")
             .bind(id)
-            .execute(self.sqlite.pool())
+            .execute(&mut **tx)
             .await?;
 
         Ok(())
@@ -182,7 +190,12 @@ impl Database {
         debug!("updating script {:?}", s);
 
         let mut tx = self.sqlite.pool().begin().await?;
+        Self::update_raw(&mut tx, s).await?;
+        tx.commit().await?;
+        Ok(())
+    }
 
+    async fn update_raw(tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>, s: &Script) -> Result<()> {
         // Update the script's base fields
         db::query(
             "update scripts set name = ?1, description = ?2, shebang = ?3, script = ?4 where id = \
@@ -193,13 +206,13 @@ impl Database {
         .bind(s.shebang.as_str())
         .bind(s.script.as_str())
         .bind(s.id.to_string())
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
 
         // Delete all existing tags for this script
         db::query("delete from script_tags where script_id = ?1")
             .bind(s.id.to_string())
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
 
         // Insert new tags
@@ -210,12 +223,28 @@ impl Database {
             )
             .bind(s.id.to_string())
             .bind(tag)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
         }
 
-        tx.commit().await?;
+        Ok(())
+    }
 
+    /// Commit the rebuilt projection atomically, preserving the previous data on failure.
+    pub(crate) async fn rebuild(&self, records: &[ScriptRecord]) -> Result<()> {
+        let mut tx = self.sqlite.pool().begin().await?;
+        db::query("delete from script_tags").execute(&mut *tx).await?;
+        db::query("delete from scripts").execute(&mut *tx).await?;
+
+        for record in records {
+            match record {
+                ScriptRecord::Create(script) => Self::save_raw(&mut tx, script).await?,
+                ScriptRecord::Update(script) => Self::update_raw(&mut tx, script).await?,
+                ScriptRecord::Delete(id) => Self::delete_raw(&mut tx, &id.to_string()).await?,
+            }
+        }
+
+        tx.commit().await?;
         Ok(())
     }
 
@@ -268,6 +297,62 @@ mod test {
             .shebang(shebang.into())
             .script(script_body.into())
             .build()
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn rebuild_replays_renames_tags_and_deletions(
+        #[future(awt)] db: Database,
+        script: Script,
+    ) {
+        let mut renamed = script.clone();
+        renamed.name = "renamed".into();
+        renamed.tags = vec!["new".into()];
+        let removed =
+            Script::builder().name("removed".into()).script("echo removed".into()).build();
+        db.save(&script).await.unwrap();
+        let records = [
+            ScriptRecord::Create(script),
+            ScriptRecord::Update(renamed.clone()),
+            ScriptRecord::Create(removed.clone()),
+            ScriptRecord::Delete(removed.id),
+        ];
+
+        // Repeated full replays must not leave stale names or duplicate tags.
+        for _ in 0..2 {
+            db.rebuild(&records).await.unwrap();
+            assert_eq!(db.list().await.unwrap(), vec![renamed.clone()]);
+        }
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn failed_rebuild_preserves_previous_projection(
+        #[future(awt)] db: Database,
+        mut script: Script,
+    ) {
+        script.tags = vec!["keep".into()];
+        db.save(&script).await.unwrap();
+        let first = Script::builder().name("first".into()).script("echo first".into()).build();
+        let second = Script::builder().name("second".into()).script("echo second".into()).build();
+        let mut conflicting = second.clone();
+        conflicting.name.clone_from(&first.name);
+        let records = [
+            ScriptRecord::Create(first),
+            ScriptRecord::Create(second),
+            ScriptRecord::Update(conflicting),
+        ];
+
+        assert!(db.rebuild(&records).await.is_err());
+        assert_eq!(db.list().await.unwrap(), vec![script]);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn empty_rebuild_clears_previous_projection(#[future(awt)] db: Database, script: Script) {
+        db.save(&script).await.unwrap();
+        db.rebuild(&[]).await.unwrap();
+        assert!(db.list().await.unwrap().is_empty());
     }
 
     #[rstest]

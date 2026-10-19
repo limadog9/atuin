@@ -15,6 +15,7 @@ use futures::StreamExt;
 use tokio::sync::{RwLock, mpsc};
 use tokio::time;
 
+use super::scripts::ScriptProjector;
 use crate::daemon::DaemonHandle;
 use crate::search::SearchIndex;
 use crate::session_capture::Recovery;
@@ -35,6 +36,7 @@ pub struct Worker {
     handle: DaemonHandle,
     index: Arc<RwLock<SearchIndex>>,
     history_store: HistoryStore,
+    scripts: ScriptProjector,
     /// Tells [`spawn_ai_session_projector`] records were downloaded; `None` without a sidecar.
     ai_session_projector: Option<mpsc::UnboundedSender<()>>,
 }
@@ -138,6 +140,7 @@ impl Worker {
             handle,
             index,
             history_store,
+            scripts: ScriptProjector::default(),
             ai_session_projector,
         })
     }
@@ -227,7 +230,7 @@ impl Worker {
             let _ = projector.send(());
         }
 
-        self.index_downloaded_records(&downloaded_records).await;
+        self.build_downloaded_records(settings, &downloaded_records).await;
 
         // Store sync time
         if let Err(e) = settings.save_sync_time().await {
@@ -235,6 +238,27 @@ impl Worker {
         }
 
         Ok(())
+    }
+
+    /// Update local projections after a sync, including retries after an earlier build failed.
+    async fn build_downloaded_records(&self, settings: &Settings, ids: &[RecordId]) {
+        self.index_downloaded_records(ids).await;
+
+        // Script records share the sync store with history, but have their own local projection.
+        // Check even after an empty download to recover failed builds and records from before
+        // this daemon started. A failed script build must not prevent history from syncing.
+        if let Err(e) = self
+            .scripts
+            .build(
+                settings,
+                self.handle.store(),
+                self.history_store.host_id,
+                self.handle.encryption_key(),
+            )
+            .await
+        {
+            tracing::error!("failed to build scripts from synced records: {e}");
+        }
     }
 
     /// Build freshly-downloaded records into `history_db` and index the resulting rows.
@@ -295,21 +319,147 @@ impl Worker {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::time::Duration;
 
     use atuin_client::ai_session::{
         AiSessionDatabase, AiSessionStore, HarnessKind, HarnessSession, Message, NativeSessionId,
         SourceId,
     };
+    use atuin_client::database::Sqlite;
+    use atuin_client::history::store::HistoryStore;
     use atuin_client::record::sqlite_store::SqliteStore;
+    use atuin_client::settings::Settings;
     use atuin_common::encryption::paseto_v4::Key;
+    use atuin_common::filter::OrFilter;
     use atuin_common::harnesstools::session::{Content, Role};
     use atuin_domain::record::{HostId, RecordId};
-    use rstest::rstest;
+    use atuin_scripts::store::ScriptStore;
+    use atuin_scripts::store::script::Script;
+    use rstest::{fixture, rstest};
     use time::OffsetDateTime;
+    use tokio::sync::RwLock;
 
-    use super::spawn_ai_session_projector;
+    use super::{ScriptProjector, Worker, spawn_ai_session_projector};
+    use crate::Daemon;
+    use crate::search::SearchIndex;
     use crate::session_capture::{AiHarnessSessionCapture, StoreState};
+
+    struct SyncEnv {
+        worker: Worker,
+        settings: Arc<Settings>,
+        _dir: tempfile::TempDir,
+    }
+
+    #[fixture]
+    async fn sync_env() -> SyncEnv {
+        let dir = tempfile::tempdir().unwrap();
+        let mut settings = Settings::utc();
+        settings.key_path = dir.path().join("key");
+        settings.scripts.db_path = dir.path().join("scripts.db").to_string_lossy().into_owned();
+        let settings = Arc::new(settings);
+        let store = SqliteStore::in_memory(Duration::from_secs(5)).await.unwrap();
+        let daemon = Daemon::builder(settings.clone())
+            .store(store.clone())
+            .history_db(Sqlite::in_memory(Duration::from_secs(5)).await.unwrap())
+            .build()
+            .unwrap();
+        let handle = daemon.handle();
+        let host_id = HostId(atuin_common::utils::uuid_v7());
+        let key = handle.encryption_key().clone();
+        let worker = Worker {
+            handle,
+            index: Arc::new(RwLock::new(SearchIndex::new(OrFilter::all()))),
+            history_store: HistoryStore::new(store, host_id, key),
+            scripts: ScriptProjector::default(),
+            ai_session_projector: None,
+        };
+        SyncEnv {
+            worker,
+            settings,
+            _dir: dir,
+        }
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn downloaded_scripts_are_built_by_the_sync_worker(#[future(awt)] sync_env: SyncEnv) {
+        let SyncEnv {
+            worker,
+            settings,
+            _dir,
+        } = sync_env;
+        let store = worker.handle.store();
+        let remote = ScriptStore::new(
+            store.clone(),
+            HostId(atuin_common::utils::uuid_v7()),
+            worker.handle.encryption_key().clone(),
+        );
+        let mut script =
+            Script::builder().name("synced".into()).script("echo original".into()).build();
+        remote.create(script.clone()).await.unwrap();
+        let ids: Vec<_> = store
+            .all_tagged(&atuin_domain::record::RecordTag::Script)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|record| record.id)
+            .collect();
+
+        worker.build_downloaded_records(&settings, &ids).await;
+        let db = atuin_scripts::database::Database::new(
+            &settings.scripts.db_path,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert_eq!(db.get_by_name("synced").await.unwrap(), Some(script.clone()));
+
+        script.script = "echo updated".into();
+        remote.update(script.clone()).await.unwrap();
+        // The download may have happened in a previous process or tick.
+        worker.build_downloaded_records(&settings, &[]).await;
+        assert_eq!(db.get_by_name("synced").await.unwrap(), Some(script.clone()));
+        remote.delete(script.id).await.unwrap();
+        worker.build_downloaded_records(&settings, &[]).await;
+        assert!(db.list().await.unwrap().is_empty());
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn failed_script_build_does_not_block_history(#[future(awt)] sync_env: SyncEnv) {
+        let SyncEnv {
+            worker,
+            settings,
+            _dir,
+        } = sync_env;
+        let script = Script::builder().name("synced".into()).script("echo synced".into()).build();
+        let remote = ScriptStore::new(
+            worker.handle.store().clone(),
+            HostId(atuin_common::utils::uuid_v7()),
+            worker.handle.encryption_key().clone(),
+        );
+        remote.create(script.clone()).await.unwrap();
+        let history: atuin_client::history::History = atuin_client::history::History::import()
+            .timestamp(OffsetDateTime::UNIX_EPOCH)
+            .command("echo history")
+            .build()
+            .into();
+        let (id, _) = worker.history_store.push(history.clone()).await.unwrap();
+        std::fs::write(&settings.scripts.db_path, "not a database").unwrap();
+
+        worker.build_downloaded_records(&settings, &[id]).await;
+        assert_eq!(worker.handle.history_db().load(history.id).await.unwrap(), Some(history));
+        std::fs::remove_file(&settings.scripts.db_path).unwrap();
+        worker.build_downloaded_records(&settings, &[]).await;
+        let db = atuin_scripts::database::Database::new(
+            &settings.scripts.db_path,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert_eq!(db.get_by_name(&script.name).await.unwrap(), Some(script));
+    }
 
     #[rstest]
     #[tokio::test]
