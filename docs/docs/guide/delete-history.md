@@ -143,6 +143,33 @@ atuin history dedup --before "2025-01-01" --dupkeep 1
 | `--before`/`-b` | Only consider entries added before this date, read in the configured `timezone` unless it carries an explicit offset (required) |
 | `--dupkeep` | Number of recent duplicates to keep |
 
+## Reclaiming local database space
+
+SQLite keeps freed pages inside `history.db` for reuse, so its file size can stay the same after data is removed. If the database has many unused pages, you can reclaim that space with SQLite's `VACUUM` command. This is optional maintenance, rather than a step needed after each deletion.
+
+Install the `sqlite3` command-line tool and find the database path with `atuin info` or `atuin config get db_path --resolved`. Use the configured path: older installations and custom `db_path` settings can put it somewhere other than the default location.
+
+Run maintenance during a quiet period. If you use the daemon, temporarily disable `daemon.autostart` and stop it with `atuin daemon stop`. Close other Atuin-enabled shells or pause their history recording so they don't write to the database during the operation.
+
+The following example uses Bash or Zsh. Choose an unused backup filename:
+
+```sh
+db_path="$(atuin config get db_path --resolved)"
+
+# Back up the database, including any committed data still in its WAL
+sqlite3 "$db_path" ".backup 'atuin-history-backup.db'"
+
+# Check the number of unused pages; zero means there are no free pages to reclaim
+sqlite3 "$db_path" 'PRAGMA freelist_count;'
+
+# Rebuild the database to return unused space to the filesystem
+sqlite3 "$db_path" 'VACUUM;'
+```
+
+`VACUUM` can take time on a large database, blocks writers, and may need up to twice the database's size in additional free disk space. Restore your daemon and autostart settings when it finishes.
+
+This only compacts the local history database. It preserves history and deletion markers, so soft-deleted entries and encrypted sync records can still occupy space. It doesn't shrink the server's database or `records.db`. Atuin's automatic WAL maintenance is separate from reclaiming free pages in `history.db`.
+
 ## Deleting your sync account
 
 To delete your remote sync account and all server-side history:
