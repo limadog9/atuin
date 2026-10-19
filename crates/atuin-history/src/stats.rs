@@ -62,23 +62,21 @@ fn interesting_command<'a>(settings: &Settings, mut command: &'a str) -> &'a str
         command = remainder;
     }
 
-    // Sort the common_subcommands by length so that we match the longest subcommand first
-    let mut common_subcommands = settings.stats.common_subcommands.clone();
-    common_subcommands.sort_by_key(|b| std::cmp::Reverse(b.len()));
-
-    // Check for a common subcommand
-    for p in &common_subcommands {
-        if command.starts_with(p) {
-            // if the subcommand is the same length as the command, then we just use the subcommand
-            if p.len() == command.len() {
-                return command;
-            }
-            // otherwise we need to use the subcommand + the next word
-            let non_whitespace = first_non_whitespace(&command[p.len()..]).unwrap_or(0);
-            let j =
-                p.len() + non_whitespace + first_whitespace(&command[p.len() + non_whitespace..]);
-            return &command[..j];
-        }
+    // Prefer the longest matching prefix across literal names and compiled patterns.
+    let literal_lengths = settings
+        .stats
+        .common_subcommands
+        .iter()
+        .filter(|p| command.starts_with(p.as_str()))
+        .map(String::len);
+    let pattern_lengths = settings.stats.common_subcommands_regex.iter().filter_map(|pattern| {
+        pattern.find(command).filter(|m| m.start() == 0 && !m.is_empty()).map(|m| m.end())
+    });
+    if let Some(len) = literal_lengths.chain(pattern_lengths).max() {
+        // Include the next word, just as for a literal common_subcommands entry.
+        let non_whitespace = first_non_whitespace(&command[len..]).unwrap_or(0);
+        let end = len + non_whitespace + first_whitespace(&command[len + non_whitespace..]);
+        return &command[..end];
     }
     // Return the first word if there is no subcommand
     &command[..first_whitespace(command)]
@@ -390,6 +388,67 @@ mod tests {
     fn interesting_commands(#[case] input: &str, #[case] expected: &str) {
         let settings = Settings::utc();
         assert_eq!(interesting_command(&settings, input), expected);
+    }
+
+    #[rstest]
+    #[case::git_options("git --no-pager log --oneline", "git --no-pager log")]
+    #[case::without_options("git status --short", "git status")]
+    #[case::prefix_removed("sudo git --no-pager log --all", "git --no-pager log")]
+    #[case::versioned_executable("python3.12 -m pip install requests", "python3.12 -m pip")]
+    #[case::unicode_subcommand("python3 -m 模块 argument", "python3 -m 模块")]
+    #[case::prefix_only("python3 -m", "python3 -m")]
+    #[case::whitespace("python3\t-m  pip install", "python3\t-m  pip")]
+    #[case::trailing_whitespace("python3 -m   ", "python3 -m")]
+    #[case::unmatched("echo python3 -m pip", "echo")]
+    #[case::empty_command("", "")]
+    fn regex_subcommands(#[case] input: &str, #[case] expected: &str) {
+        let mut settings = Settings::utc();
+        settings.stats.common_subcommands_regex =
+            [r"^git(?:\s+--no-pager)?", r"^python[0-9.]*\s+-m"]
+                .map(|pattern| pattern.parse().unwrap())
+                .into();
+        assert_eq!(interesting_command(&settings, input), expected);
+    }
+
+    #[rstest]
+    #[case::longer_pattern(&[r"^git", r"^git\s+--no-pager"], &[], "git --no-pager log")]
+    #[case::reverse_order(&[r"^git\s+--no-pager", r"^git"], &[], "git --no-pager log")]
+    #[case::longer_literal(&[r"^git"], &["git --no-pager"], "git --no-pager log")]
+    #[case::not_at_start(&[r"--no-pager"], &[], "git --no-pager")]
+    #[case::empty_match(&[r"^"], &[], "git --no-pager")]
+    fn regex_subcommands_prefer_longest_prefix(
+        #[case] patterns: &[&str],
+        #[case] literals: &[&str],
+        #[case] expected: &str,
+    ) {
+        let mut settings = Settings::utc();
+        settings.stats.common_subcommands.extend(literals.iter().map(|p| p.to_string()));
+        settings.stats.common_subcommands_regex =
+            patterns.iter().map(|pattern| pattern.parse().unwrap()).collect();
+        assert_eq!(interesting_command(&settings, "git --no-pager log --all"), expected);
+    }
+
+    #[rstest]
+    fn regex_subcommands_in_stats() {
+        let mut settings = Settings::utc();
+        settings.stats.common_subcommands_regex = vec![r"^python[0-9.]*\s+-m".parse().unwrap()];
+        settings.stats.ignored_commands = vec!["python3 -m ignored".to_string()];
+        let history: Vec<History> = [
+            "ENV=value sudo python3 -m pip install requests | python3 -m json.tool",
+            "python3 -m pip freeze | python3 -m json.tool --indent 2",
+            "python3 -m ignored argument",
+        ]
+        .map(|command| {
+            History::import().timestamp(OffsetDateTime::UNIX_EPOCH).command(command).build().into()
+        })
+        .into();
+
+        let stats = compute(&settings, &history, 10, 2).unwrap();
+        assert_eq!(stats.total_commands, 2);
+        assert_eq!(stats.top, vec![(
+            vec!["python3 -m pip".into(), "python3 -m json.tool".into()],
+            2
+        )]);
     }
 
     #[rstest]

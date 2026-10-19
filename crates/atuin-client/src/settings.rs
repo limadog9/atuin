@@ -17,7 +17,7 @@ use config::builder::DefaultState;
 use config::{Config, ConfigBuilder, Environment, File as ConfigFile, FileFormat};
 use eyre::{Context, Result, eyre};
 use fs_err::{File, create_dir_all};
-use regex::RegexSet;
+use regex::{Regex, RegexSet};
 use secrecy::SecretString;
 use semver::Version;
 use serde::{Deserialize, Serialize};
@@ -303,6 +303,9 @@ pub struct Stats {
     pub common_prefix: Vec<String>, // sudo, etc. commands we want to strip off
     #[serde(default = "Stats::common_subcommands_default")]
     pub common_subcommands: Vec<String>, // kubectl, commands we should consider subcommands for
+    /// Additional command prefixes, matched as regular expressions before the next word.
+    #[serde(with = "serde_regex", default)]
+    pub common_subcommands_regex: Vec<Regex>,
     #[serde(default = "Stats::ignored_commands_default")]
     pub ignored_commands: Vec<String>, // cd, ls, etc. commands we want to completely hide from stats
 }
@@ -351,6 +354,7 @@ impl Default for Stats {
         Self {
             common_prefix: Self::common_prefix_default(),
             common_subcommands: Self::common_subcommands_default(),
+            common_subcommands_regex: Vec::new(),
             ignored_commands: Self::ignored_commands_default(),
         }
     }
@@ -2308,6 +2312,35 @@ mod tests {
         assert!(!settings.threads.capture);
         assert!(settings.threads.capture_tools);
         assert!(settings.threads.resume_chooser);
+    }
+
+    #[rstest]
+    #[case::default("")]
+    #[case::partial_stats("[stats]\ncommon_prefix = ['sudo']")]
+    fn stats_subcommand_patterns_default_empty(#[case] config: &str) {
+        assert!(parse_settings(config).stats.common_subcommands_regex.is_empty());
+    }
+
+    #[rstest]
+    fn stats_subcommand_patterns_load_and_serialize() {
+        let settings = parse_settings(
+            r"[stats]
+common_subcommands_regex = ['^git(?:\s+--no-pager)?', '^python[0-9.]*\s+-m']",
+        );
+        let patterns = &settings.stats.common_subcommands_regex;
+        assert_eq!(patterns.len(), 2);
+        assert!(patterns[0].is_match("git --no-pager log"));
+        assert!(patterns[1].is_match("python3.12 -m pip"));
+        let serialized = serde_json::to_value(&settings.stats).unwrap();
+        assert_eq!(serialized["common_subcommands_regex"][0], patterns[0].as_str());
+    }
+
+    #[rstest]
+    fn stats_subcommand_patterns_reject_invalid_regex() {
+        let err = Settings::validate_str("[stats]\ncommon_subcommands_regex = ['[']")
+            .expect_err("invalid regular expressions must fail config validation")
+            .to_string();
+        assert!(err.contains("common_subcommands_regex"), "{err}");
     }
 
     #[rstest]

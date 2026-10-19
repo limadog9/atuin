@@ -216,6 +216,10 @@ enter_accept = true
 #   "yarn",
 # ]
 
+## additional regex prefixes to group with their following subcommand
+## single-quoted TOML strings preserve regex backslashes
+# common_subcommands_regex = ['^git(?:\s+--no-pager)?', '^python[0-9.]*\s+-m']
+
 ## Set commands that should be totally stripped and ignored from stats
 # common_prefix = ["sudo"]
 

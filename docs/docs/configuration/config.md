@@ -848,6 +848,24 @@ common_subcommands = [
 
 Configures commands where Atuin should consider the subcommand as part of the statistics. For example, consider `kubectl get` rather than just `kubectl`.
 
+### `common_subcommands_regex`
+
+Default: `[]`
+
+Additional command prefixes expressed as regular expressions. Atuin includes the next word after the matched prefix in the statistics, just as for `common_subcommands`. Patterns must match at the start of a command; empty matches are ignored. When several literal names or patterns match, the longest matched prefix wins.
+
+For example, include Git options before its subcommand, or recognize versioned Python executables:
+
+```toml
+[stats]
+common_subcommands_regex = [
+  '^git(?:\s+--no-pager)?',
+  '^python[0-9.]*\s+-m',
+]
+```
+
+This groups `git --no-pager log --oneline` under `git --no-pager log` and `python3.12 -m pip install requests` under `python3.12 -m pip`. Patterns apply after common prefixes and leading environment assignments are removed, and separately to each pipeline stage. Use TOML literal strings (single quotes) to preserve regex backslashes.
+
 ### `common_prefix`
 
 Default:
